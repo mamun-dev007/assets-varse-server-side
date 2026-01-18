@@ -10,7 +10,10 @@ const admin = require("firebase-admin");
 
 // const serviceAccount = require("./assetverse-firebase-adminsdk.json");
 
-const decoded = Buffer.from(process.env.ASSETVERSE_SERVICE_KEY, 'base64').toString('utf8')
+const decoded = Buffer.from(
+  process.env.ASSETVERSE_SERVICE_KEY,
+  "base64"
+).toString("utf8");
 const serviceAccount = JSON.parse(decoded);
 
 admin.initializeApp({
@@ -61,6 +64,8 @@ async function run() {
     const affiliations = db.collection("employeeAffiliations");
     const paymentCollection = db.collection("payment");
     const packageCollection = db.collection("paka");
+    const notices = db.collection("notices");
+    const noticeReadStatus = db.collection("noticeReadStatus");
 
     // verifyAdmin
 
@@ -191,6 +196,12 @@ async function run() {
             { $set: { status: "Approved", approvalDate: new Date() } }
           );
 
+          // Deduct quantity from the asset
+          await assets.updateOne(
+            { _id: new ObjectId(requestDoc.assetId) },
+            { $inc: { quantity: -1 } }
+          );
+
           const employee = await userCollection.findOne({
             email: requestDoc.userEmail,
           });
@@ -200,19 +211,30 @@ async function run() {
                 "Employee account not found. Ask employee to register first.",
             });
           }
-          await affiliations.insertOne({
+
+          // Check if employee is already affiliated with this company
+          const existingAffiliation = await affiliations.findOne({
             employeeEmail: requestDoc.userEmail,
-            employeeName: employee.name,
-            hrEmail: requestDoc.hrEmail,
             companyName: requestDoc.companyName,
-            joinedAt: new Date(),
-            affiliationDate: new Date(),
             status: "active",
           });
-          await userCollection.updateOne(
-            { email: requestDoc.hrEmail },
-            { $inc: { currentEmployees: 1 } }
-          );
+
+          // Only create new affiliation if not already affiliated with this company
+          if (!existingAffiliation && requestDoc.companyName) {
+            await affiliations.insertOne({
+              employeeEmail: requestDoc.userEmail,
+              employeeName: employee.name || employee.displayName || "Unknown",
+              hrEmail: requestDoc.hrEmail,
+              companyName: requestDoc.companyName,
+              joinedAt: new Date(),
+              affiliationDate: new Date(),
+              status: "active",
+            });
+            await userCollection.updateOne(
+              { email: requestDoc.hrEmail },
+              { $inc: { currentEmployees: 1 } }
+            );
+          }
 
           res.send({ message: "Approved successfully", approveResult });
         } catch (err) {
@@ -298,7 +320,7 @@ async function run() {
 
     // hr requerment
     // assetsList
-    app.get("/assets/hr",jwt, verifyAdmin, async (req, res) => {
+    app.get("/assets/hr", jwt, verifyAdmin, async (req, res) => {
       try {
         const { hrEmail, search = "", page = 1, limit = 10 } = req.query;
 
@@ -330,7 +352,7 @@ async function run() {
     });
 
     // hrAddAssets
-    app.post("/assets",jwt, verifyAdmin, async (req, res) => {
+    app.post("/assets", jwt, verifyAdmin, async (req, res) => {
       const body = req.body;
 
       const assetDoc = {
@@ -348,14 +370,14 @@ async function run() {
       res.send({ insertedId: result.insertedId, asset: assetDoc });
     });
     // delete
-    app.delete("/assets/:id",jwt, verifyAdmin, async (req, res) => {
+    app.delete("/assets/:id", jwt, verifyAdmin, async (req, res) => {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
 
       const result = await assets.deleteOne(query);
       res.send(result);
     });
-    app.patch("/assets/:id",jwt, verifyAdmin, async (req, res) => {
+    app.patch("/assets/:id", jwt, verifyAdmin, async (req, res) => {
       try {
         const id = req.params.id;
         const { productName, productType, productQuantity, productImage } =
@@ -412,7 +434,8 @@ async function run() {
           value: t.total,
         }));
 
-        const topAssets = await requests
+        // Top requested assets from assignedAssets collection
+        const topAssets = await assignedAssets
           .aggregate([
             { $match: { hrEmail } },
             {
@@ -433,9 +456,16 @@ async function run() {
           ])
           .toArray();
 
+        // Pending requests count
+        const pendingRequests = await assignedAssets.countDocuments({
+          hrEmail,
+          status: "Pending",
+        });
+
         res.send({
           assetTypes,
           topRequestedAssets: topAssets,
+          pendingRequests,
         });
       } catch (err) {
         res.status(500).send({ message: "Server error", error: err.message });
@@ -445,7 +475,10 @@ async function run() {
     app.get("/assigned-assets/mine", async (req, res) => {
       const { email, search = "", type = "", page = 1, limit = 10 } = req.query;
 
-      const query = { userEmail: email };
+      const query = {
+        userEmail: email,
+        status: { $in: ["Approved", "Pending"] },
+      };
 
       if (type) {
         query.assetType = type;
@@ -478,7 +511,7 @@ async function run() {
 
     app.get("/assets/available", async (req, res) => {
       try {
-        const { search = "", type = "" } = req.query;
+        const { search = "", type = "", companyName = "" } = req.query;
 
         const query = {
           availableQuantity: { $gt: 0 },
@@ -492,6 +525,10 @@ async function run() {
           query.productType = type;
         }
 
+        if (companyName) {
+          query.companyName = companyName;
+        }
+
         const result = await assets
           .find(query)
           .sort({ dateAdded: -1 })
@@ -500,6 +537,25 @@ async function run() {
         res.send(result);
       } catch (err) {
         res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // Get employee's affiliations (for multiple company support)
+    app.get("/affiliations", async (req, res) => {
+      try {
+        const { employeeEmail } = req.query;
+        if (!employeeEmail) {
+          return res.status(400).send({ message: "employeeEmail required" });
+        }
+
+        const data = await affiliations
+          .find({ employeeEmail, status: "active" })
+          .sort({ affiliationDate: -1 })
+          .toArray();
+
+        res.send(data);
+      } catch (err) {
+        res.status(500).send({ message: "Failed to load affiliations" });
       }
     });
 
@@ -553,8 +609,21 @@ async function run() {
           return res.status(404).send({ message: "Employee not in team" });
         }
 
+        // Delete from affiliations collection
         await affiliations.deleteOne({ _id: affiliation._id });
-        // decrease HR employee count
+        
+        // Remove company affiliation from user collection
+        await userCollection.updateOne(
+          { email: email },
+          { 
+            $unset: { 
+              companyName: "",
+              hrEmail: ""
+            }
+          }
+        );
+        
+        // Decrease HR employee count
         if (affiliation.hrEmail) {
           await userCollection.updateOne(
             { email: affiliation.hrEmail },
@@ -573,7 +642,7 @@ async function run() {
 
     // GET: All Packages
 
-    app.get("/packages",jwt, verifyAdmin, async (req, res) => {
+    app.get("/packages", jwt, verifyAdmin, async (req, res) => {
       try {
         const packages = await packageCollection
           .find()
@@ -587,7 +656,7 @@ async function run() {
 
     //  create stripe payment intent
 
-    app.post("/create-payment-intent",jwt, verifyAdmin,  async (req, res) => {
+    app.post("/create-payment-intent", jwt, verifyAdmin, async (req, res) => {
       try {
         const { price, packageName, hrEmail, employeeLimit } = req.body;
 
@@ -822,6 +891,8 @@ async function run() {
         hrEmail = "",
         status = "",
         search = "",
+        page = 1,
+        limit = 10,
       } = req.query;
 
       const query = {};
@@ -838,12 +909,22 @@ async function run() {
         ];
       }
 
+      const skip = (Number(page) - 1) * Number(limit);
+      const total = await assignedAssets.countDocuments(query);
+
       const result = await assignedAssets
         .find(query)
         .sort({ requestDate: -1 })
+        .skip(skip)
+        .limit(Number(limit))
         .toArray();
 
-      res.send(result);
+      res.send({
+        requests: result,
+        total,
+        totalPages: Math.ceil(total / Number(limit)),
+        currentPage: Number(page),
+      });
     });
 
     app.get("/assets/:id", async (req, res) => {
@@ -869,16 +950,20 @@ async function run() {
           note = "",
         } = req.body;
 
-        if (!assetId || !ObjectId.isValid(assetId)) {
-          return res.status(400).send({ message: "Valid assetId required" });
+        let validAssetId;
+        try {
+          validAssetId = new ObjectId(assetId);
+        } catch (err) {
+          return res.status(400).send({ message: "Invalid assetId" });
         }
+
         if (!userEmail || !companyName) {
           return res
             .status(400)
             .send({ message: "userEmail and companyName required" });
         }
 
-        const asset = await assets.findOne({ _id: new ObjectId(assetId) });
+        const asset = await assets.findOne({ _id: validAssetId });
         if (!asset) return res.status(404).send({ message: "Asset not found" });
 
         if ((asset.availableQuantity ?? 0) <= 0) {
@@ -1046,6 +1131,310 @@ async function run() {
       res.send({ role: user.role });
     });
 
+    // ============ NOTICE BOARD SYSTEM ============
+
+    // Create notice (HR only)
+    app.post("/notices", jwt, verifyAdmin, async (req, res) => {
+      try {
+        const { title, content, priority = "medium" } = req.body;
+        const hrEmail = req.decoded_email;
+
+        // Validation
+        if (!title || !content) {
+          return res
+            .status(400)
+            .send({ message: "Title and content required" });
+        }
+        if (title.length < 5) {
+          return res
+            .status(400)
+            .send({ message: "Title must be at least 5 characters" });
+        }
+        if (content.length < 10) {
+          return res
+            .status(400)
+            .send({ message: "Content must be at least 10 characters" });
+        }
+        if (!["high", "medium", "low"].includes(priority)) {
+          return res
+            .status(400)
+            .send({ message: "Priority must be high, medium, or low" });
+        }
+
+        // Get HR's company
+        const hr = await userCollection.findOne({ email: hrEmail });
+        if (!hr || !hr.companyName) {
+          return res.status(400).send({ message: "HR company not found" });
+        }
+
+        const noticeDoc = {
+          title,
+          content,
+          priority,
+          companyName: hr.companyName,
+          hrEmail,
+          createdAt: new Date(),
+          updatedAt: null,
+        };
+
+        const result = await notices.insertOne(noticeDoc);
+        res.send({
+          message: "Notice created",
+          insertedId: result.insertedId,
+          notice: noticeDoc,
+        });
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // Get notices by company
+    app.get("/notices", async (req, res) => {
+      try {
+        const { companyName, hrEmail } = req.query;
+
+        const query = {};
+        if (companyName) query.companyName = companyName;
+        if (hrEmail) query.hrEmail = hrEmail;
+
+        const result = await notices
+          .find(query)
+          .sort({
+            priority: 1, // Will need custom sort
+            createdAt: -1,
+          })
+          .toArray();
+
+        // Custom sort: high=0, medium=1, low=2, then by date
+        const priorityOrder = { high: 0, medium: 1, low: 2 };
+        result.sort((a, b) => {
+          const pDiff = priorityOrder[a.priority] - priorityOrder[b.priority];
+          if (pDiff !== 0) return pDiff;
+          return new Date(b.createdAt) - new Date(a.createdAt);
+        });
+
+        res.send(result);
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // Get unread count for employee (MUST be before /notices/:id)
+    app.get("/notices/unread-count", async (req, res) => {
+      try {
+        const { email, companyName } = req.query;
+
+        if (!email || !companyName) {
+          return res
+            .status(400)
+            .send({ message: "email and companyName required" });
+        }
+
+        // Get all notices for company
+        const companyNotices = await notices.find({ companyName }).toArray();
+        const noticeIds = companyNotices.map((n) => n._id);
+
+        // Get read notices for this employee
+        const readNotices = await noticeReadStatus
+          .find({
+            noticeId: { $in: noticeIds },
+            employeeEmail: email,
+          })
+          .toArray();
+
+        const unreadCount = companyNotices.length - readNotices.length;
+
+        res.send({ unreadCount, total: companyNotices.length });
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // Get notices with read status for employee (MUST be before /notices/:id)
+    app.get("/notices/employee", async (req, res) => {
+      try {
+        const { email, companyName } = req.query;
+
+        if (!email || !companyName) {
+          return res
+            .status(400)
+            .send({ message: "email and companyName required" });
+        }
+
+        // Get all notices for company
+        const companyNotices = await notices.find({ companyName }).toArray();
+
+        // Get read status for this employee
+        const readStatuses = await noticeReadStatus
+          .find({ employeeEmail: email })
+          .toArray();
+
+        const readNoticeIds = new Set(
+          readStatuses.map((r) => r.noticeId.toString())
+        );
+
+        // Add isRead flag to each notice
+        const noticesWithStatus = companyNotices.map((notice) => ({
+          ...notice,
+          isRead: readNoticeIds.has(notice._id.toString()),
+        }));
+
+        // Sort by priority then date
+        const priorityOrder = { high: 0, medium: 1, low: 2 };
+        noticesWithStatus.sort((a, b) => {
+          const pDiff = priorityOrder[a.priority] - priorityOrder[b.priority];
+          if (pDiff !== 0) return pDiff;
+          return new Date(b.createdAt) - new Date(a.createdAt);
+        });
+
+        res.send(noticesWithStatus);
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // Get single notice (dynamic route - MUST be after specific routes)
+    app.get("/notices/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const notice = await notices.findOne({ _id: new ObjectId(id) });
+
+        if (!notice) {
+          return res.status(404).send({ message: "Notice not found" });
+        }
+
+        res.send(notice);
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // Update notice (HR only)
+    app.patch("/notices/:id", jwt, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const hrEmail = req.decoded_email;
+        const { title, content, priority } = req.body;
+
+        const notice = await notices.findOne({ _id: new ObjectId(id) });
+        if (!notice) {
+          return res.status(404).send({ message: "Notice not found" });
+        }
+
+        // Check ownership
+        if (notice.hrEmail !== hrEmail) {
+          return res
+            .status(403)
+            .send({ message: "Cannot edit notices from other companies" });
+        }
+
+        // Validation
+        if (title && title.length < 5) {
+          return res
+            .status(400)
+            .send({ message: "Title must be at least 5 characters" });
+        }
+        if (content && content.length < 10) {
+          return res
+            .status(400)
+            .send({ message: "Content must be at least 10 characters" });
+        }
+        if (priority && !["high", "medium", "low"].includes(priority)) {
+          return res
+            .status(400)
+            .send({ message: "Priority must be high, medium, or low" });
+        }
+
+        const updateDoc = {
+          $set: {
+            ...(title && { title }),
+            ...(content && { content }),
+            ...(priority && { priority }),
+            updatedAt: new Date(),
+          },
+        };
+
+        const result = await notices.updateOne(
+          { _id: new ObjectId(id) },
+          updateDoc
+        );
+        res.send({ message: "Notice updated", result });
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // Delete notice (HR only) - cascade delete read status
+    app.delete("/notices/:id", jwt, verifyAdmin, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const hrEmail = req.decoded_email;
+
+        const notice = await notices.findOne({ _id: new ObjectId(id) });
+        if (!notice) {
+          return res.status(404).send({ message: "Notice not found" });
+        }
+
+        // Check ownership
+        if (notice.hrEmail !== hrEmail) {
+          return res
+            .status(403)
+            .send({ message: "Cannot delete notices from other companies" });
+        }
+
+        // Delete notice
+        await notices.deleteOne({ _id: new ObjectId(id) });
+
+        // Cascade delete read status records
+        await noticeReadStatus.deleteMany({ noticeId: new ObjectId(id) });
+
+        res.send({ message: "Notice deleted" });
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
+    // Mark notice as read
+    app.post("/notices/:id/read", async (req, res) => {
+      try {
+        const noticeId = req.params.id;
+        const { employeeEmail } = req.body;
+
+        if (!employeeEmail) {
+          return res.status(400).send({ message: "employeeEmail required" });
+        }
+
+        const notice = await notices.findOne({ _id: new ObjectId(noticeId) });
+        if (!notice) {
+          return res.status(404).send({ message: "Notice not found" });
+        }
+
+        // Check if already read
+        const existing = await noticeReadStatus.findOne({
+          noticeId: new ObjectId(noticeId),
+          employeeEmail,
+        });
+
+        if (existing) {
+          return res.send({
+            message: "Already marked as read",
+            alreadyRead: true,
+          });
+        }
+
+        // Mark as read
+        await noticeReadStatus.insertOne({
+          noticeId: new ObjectId(noticeId),
+          employeeEmail,
+          readAt: new Date(),
+        });
+
+        res.send({ message: "Marked as read" });
+      } catch (err) {
+        res.status(500).send({ message: "Server error", error: err.message });
+      }
+    });
+
     // Send a ping to confirm a successful connection
     // await client.db("admin").command({ ping: 1 });
     // console.log(
@@ -1055,8 +1444,6 @@ async function run() {
   }
 }
 run().catch(console.dir);
-
-
 
 app.get("/", (req, res) => {
   res.send("assetVerse  is shifting!");
